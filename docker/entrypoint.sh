@@ -1,10 +1,33 @@
 #!/bin/bash
 
+echo "Setting up docker env..."
+echo "MODE: $MODE"
+echo "USE_NEW_DESIGN: $USE_NEW_DESIGN"
+echo "SERVER_LIST_URL: $SERVER_LIST_URL"
+echo "WEBPORT: $WEBPORT"
+echo "REDACT_IP_ADDRESSES: $REDACT_IP_ADDRESSES"
+echo "DB_TYPE: $DB_TYPE"
+echo "ENABLE_ID_OBFUSCATION: $ENABLE_ID_OBFUSCATION"
+echo "GDPR_EMAIL: $GDPR_EMAIL"
+
 set -e
-set -x
+#set -x
 
 is_alpine() {
   [ -f /etc/alpine-release ]
+}
+
+html_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&#39;/g"
+}
+
+sed_escape() {
+  printf '%s\n' "$1" | sed 's/[&/\\]/\\&/g; s/\$/\\$/g'
 }
 
 # Cleanup
@@ -12,9 +35,16 @@ rm -rf /var/www/html/*
 
 # Copy frontend files
 cp /speedtest/*.js /var/www/html/
+cp /speedtest/stability.html /var/www/html/
 
-# Copy favicon
+# Copy design switch files
+cp /speedtest/config.json /var/www/html/
+cp /speedtest/design-switch.js /var/www/html/
+
+# Copy PWA metadata and icons
 cp /speedtest/favicon.ico /var/www/html/
+cp /speedtest/manifest.webmanifest /var/www/html/
+cp -r /speedtest/images /var/www/html/
 
 # Set custom webroot on alpine
 if is_alpine; then
@@ -24,6 +54,11 @@ else
   echo "DEBIAN IMAGE"
 fi
 
+
+# Copy servers.json for stability page (frontend/dual modes)
+if [[ "$MODE" == "frontend" || "$MODE" == "dual" ]] && [ -f /servers.json ]; then
+  cp /servers.json /var/www/html/servers.json
+fi
 
 # Set up backend side for standlone modes
 if [[ "$MODE" == "standalone" || "$MODE" == "dual" ]]; then
@@ -40,14 +75,93 @@ if [ "$MODE" == "backend" ]; then
   fi
 fi
 
-# Set up unified index.php
-if [ "$MODE" != "backend" ]; then
-  cp /speedtest/ui.php /var/www/html/index.php
+# Set up index.php for frontend-only or standalone modes
+if [[ "$MODE" == "frontend" || "$MODE" == "dual" ||  "$MODE" == "standalone" ]]; then
+  # Copy design files (switcher + both designs)
+  cp /speedtest/index.html /var/www/html/
+  cp /speedtest/index-classic.html /var/www/html/
+  cp /speedtest/index-modern.html /var/www/html/
+  cp /speedtest/stability.html /var/www/html/
+  # Keep the frontend assets under frontend/, which is where the HTML looks for
+  # them and where they sit in the repository
+  cp -a /speedtest/frontend /var/www/html/
+
+  # Copy frontend config files
+  cp /speedtest/settings.json /var/www/html/settings.json 2>/dev/null || true
+  if [ -f /servers.json ]; then
+    echo "using mounted /servers.json for server-list.json"
+    cp /servers.json /var/www/html/server-list.json
+  elif [ -n "$SERVER_LIST_URL" ]; then
+    echo "no /servers.json found, relying on SERVER_LIST_URL"
+  elif [ "$MODE" == "frontend" ]; then
+    echo "ERROR: /servers.json not found and SERVER_LIST_URL is not set" >&2
+    exit 1
+  else
+    echo "no /servers.json found, create one for local host"
+    # generate config for just the local server
+    echo '[{"name":"local","server":"/backend",  "dlURL": "garbage.php", "ulURL": "empty.php", "pingURL": "empty.php", "getIpURL": "getIP.php", "sponsorName": "", "sponsorURL": "", "id":1 }]' > /var/www/html/server-list.json
+  fi
+  if [ ! -z "$SERVER_LIST_URL" ]; then
+    echo "using SERVER_LIST_URL for frontend server list"
+    SERVER_LIST_URL_ESCAPED=$(printf '%s\n' "$SERVER_LIST_URL" | sed 's/[&/\\]/\\&/g; s/\$/\\$/g')
+    sed -i "s/var SPEEDTEST_SERVERS = \"server-list.json\";/var SPEEDTEST_SERVERS = \"$SERVER_LIST_URL_ESCAPED\";/" /var/www/html/index-modern.html
+    sed -i "/var SPEEDTEST_SERVERS = \\[/,/^[[:space:]]*];/c\\\t\tvar SPEEDTEST_SERVERS = \"$SERVER_LIST_URL_ESCAPED\";" /var/www/html/index-classic.html
+    sed -i "s/var SPEEDTEST_SERVERS = \"server-list.json\";/var SPEEDTEST_SERVERS = \"$SERVER_LIST_URL_ESCAPED\";/" /var/www/html/stability.html
+  fi
+
+  # The stability page reads the same local server list as the main UI when present.
+  if [ -f /var/www/html/server-list.json ]; then
+    cp /var/www/html/server-list.json /var/www/html/servers.json
+  fi
+
+  # Replace title placeholders if TITLE is set
+  if [ ! -z "$TITLE" ]; then
+    TITLE_ONE_LINE=${TITLE//$'\r'/}
+    TITLE_ONE_LINE=${TITLE_ONE_LINE//$'\n'/ }
+    TITLE_HTML_ESCAPED=$(html_escape "$TITLE_ONE_LINE")
+    TITLE_ESCAPED=$(sed_escape "$TITLE_HTML_ESCAPED")
+    sed -i "s/<title>LibreSpeed<\\/title>/<title>$TITLE_ESCAPED<\\/title>/g; s/<h1>LibreSpeed<\\/h1>/<h1>$TITLE_ESCAPED<\\/h1>/g" /var/www/html/index-classic.html
+    sed -i "s/<title>LibreSpeed<\\/title>/<title>$TITLE_ESCAPED<\\/title>/g" /var/www/html/index.html
+    sed -i "s/<title>LibreSpeed - Free and Open Source Speedtest<\\/title>/<title>$TITLE_ESCAPED - Free and Open Source Speedtest<\\/title>/g; s/<h1>Free and Open Source Speedtest\\.<\\/h1>/<h1>$TITLE_ESCAPED<\\/h1>/g" /var/www/html/index-modern.html
+  fi
+
+  # Replace modern page tagline if TAGLINE is set
+  if [ -n "$TAGLINE" ]; then
+    TAGLINE_ONE_LINE=${TAGLINE//$'\r'/}
+    TAGLINE_ONE_LINE=${TAGLINE_ONE_LINE//$'\n'/ }
+    TAGLINE_HTML_ESCAPED=$(html_escape "$TAGLINE_ONE_LINE")
+    TAGLINE_ESCAPED=$(sed_escape "$TAGLINE_HTML_ESCAPED")
+    sed -i "s/<p class=\"tagline\">No Flash, No Java, No Websockets, No Bullsh\\*t<\\/p>/<p class=\"tagline\">$TAGLINE_ESCAPED<\\/p>/g" /var/www/html/index-modern.html
+  fi
+
+  # Support legacy EMAIL env var as fallback for GDPR_EMAIL
+  if [ -z "$GDPR_EMAIL" ] && [ ! -z "$EMAIL" ]; then
+    echo "WARNING: EMAIL env var is deprecated, please use GDPR_EMAIL instead" >&2
+    GDPR_EMAIL="$EMAIL"
+    echo "GDPR_EMAIL: $GDPR_EMAIL"
+  fi
+
+  # Replace GDPR email placeholder if GDPR_EMAIL is set
+  if [ ! -z "$GDPR_EMAIL" ]; then
+    # Escape special sed characters: & (replacement), / (delimiter), \ (escape), $ (variable)
+    GDPR_EMAIL_ESCAPED=$(printf '%s\n' "$GDPR_EMAIL" | sed 's/[&/\\]/\\&/g; s/\$/\\$/g')
+
+    for html_file in /var/www/html/index-modern.html /var/www/html/index-classic.html; do
+      if [ -f "$html_file" ]; then
+        sed -i "s/TO BE FILLED BY DEVELOPER/$GDPR_EMAIL_ESCAPED/g; s/PUT@YOUR_EMAIL.HERE/$GDPR_EMAIL_ESCAPED/g" "$html_file"
+      fi
+    done
+  fi
+fi
+# Configure design preference via config.json
+if [ "$USE_NEW_DESIGN" == "true" ]; then
+  sed -i 's/"useNewDesign": false/"useNewDesign": true/' /var/www/html/config.json
 fi
 
 # Apply Telemetry settings when running in standalone or frontend mode and telemetry is enabled
 if [[ "$TELEMETRY" == "true" && ("$MODE" == "frontend" || "$MODE" == "standalone" || "$MODE" == "dual") ]]; then
   cp -r /speedtest/results /var/www/html/results
+  sed -i 's/telemetry_level": ".*"/telemetry_level": "basic"/' /var/www/html/settings.json
 
   if [ "$MODE" == "frontend" ]; then
     mkdir /var/www/html/backend
@@ -73,7 +187,9 @@ if [[ "$TELEMETRY" == "true" && ("$MODE" == "frontend" || "$MODE" == "standalone
     sed -i s/\$db_type\ =\ \'.*\'/\$db_type\ =\ \'sqlite\'\/g /var/www/html/results/telemetry_settings.php
   fi
 
-  sed -i s/\$Sqlite_db_file\ =\ \'.*\'/\$Sqlite_db_file=\'\\\/database\\\/db.sql\'/g /var/www/html/results/telemetry_settings.php
+  # Override SQLite database path for Docker environment
+  # In Docker, we use /database/db.sql which is outside the web-accessible directory
+  sed -i s/\$Sqlite_db_file\ =\ .*\'/\$Sqlite_db_file=\'\\\/database\\\/db.sql\'/g /var/www/html/results/telemetry_settings.php
   sed -i s/\$stats_password\ =\ \'.*\'/\$stats_password\ =\ \'$PASSWORD\'/g /var/www/html/results/telemetry_settings.php
 
   if [ "$ENABLE_ID_OBFUSCATION" == "true" ]; then
